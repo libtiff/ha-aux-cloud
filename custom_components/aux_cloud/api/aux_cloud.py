@@ -321,7 +321,9 @@ class AuxCloudAPI:
 
                 # Create tasks for fetching device params
                 dev_params_task = asyncio.create_task(
-                    self.get_device_params(dev, params=list([]))
+                    self.get_device_params(
+                        dev, params=AuxProducts.get_params_list(dev["productId"])
+                    )
                 )
                 dev_special_params_task = None
 
@@ -359,9 +361,11 @@ class AuxCloudAPI:
                 dev_special_params = results[i][1] if len(results[i]) > 1 else None
 
                 if dev_params is None or isinstance(dev_params, BaseException):
+                    _LOGGER.debug(results[i])
                     _LOGGER.error(
-                        "Error fetching device params for %s",
+                        "Error fetching device params for %s, %s",
                         dev["endpointId"],
+                        dev_params,
                     )
                     continue
 

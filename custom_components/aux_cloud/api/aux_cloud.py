@@ -8,9 +8,8 @@ from typing import TypedDict
 
 import aiohttp
 
-from .const import AuxProducts
+from .const import AuxProducts, HP_HOT_WATER_TANK_TEMPERATURE
 from .util import encrypt_aes_cbc_zero_padding
-from .aux_cloud_ws import AuxCloudWebSocket
 
 TIMESTAMP_TOKEN_ENCRYPT_KEY = "kdixkdqp54545^#*"
 PASSWORD_ENCRYPT_KEY = "4969fj#k23#"
@@ -73,9 +72,31 @@ class AuxApiError(Exception):
     """Exception raised when querying devices fails."""
 
 
+def _decode_hp_tank_temp_from_key_states(key_states_hex: str) -> int | None:
+    """Decode Heat Pump tank temperature from key_states.
+
+    Observed encoding:
+      temp_c = key_states_bytes[2] - 32
+
+    Return x10 (e.g. 360 => 36.0C), to match other temps in integration.
+    """
+    if not key_states_hex or not isinstance(key_states_hex, str):
+        return None
+    try:
+        raw = bytes.fromhex(key_states_hex)
+        if len(raw) < 3:
+            return None
+        temp_c = raw[2] - 32
+        if temp_c < -20 or temp_c > 120:
+            return None
+        return int(temp_c) * 10
+    except Exception:
+        return None
+
+
 class AuxCloudAPI:
     """
-    Class for interacting with AUX cloud services.
+    Class for interacting with AUX cloud services (REST only).
     """
 
     def __init__(self, region: str = "eu"):
@@ -91,8 +112,6 @@ class AuxCloudAPI:
         self.password = None
         self.loginsession = None
         self.userid = None
-
-        self.ws_api = None
 
     def _get_headers(self, **kwargs: str):
         return {
@@ -171,7 +190,7 @@ class AuxCloudAPI:
         }
         json_payload = json.dumps(payload, separators=(",", ":"))
 
-        # Token used as an obfuscation attempt, the server validates the
+        # Token used as an obfuscation attempt, the server validates it
         token = hashlib.md5(f"{json_payload}{BODY_ENCRYPT_KEY}".encode()).hexdigest()
 
         # Token used as key in aes encryption of json body
@@ -201,7 +220,6 @@ class AuxCloudAPI:
         """
         Check if the user is logged in.
         """
-        # TODO: Implement a request to check if the session is still valid
         return self.loginsession is not None and self.userid is not None
 
     async def get_families(self):
@@ -320,20 +338,26 @@ class AuxCloudAPI:
                 )
 
                 # Create tasks for fetching device params
+                # Heat pump firmware (pid c3aa0000) returns a full snapshot when requesting params=["ver"].
+                if dev.get("productId") in AuxProducts.DeviceType.HEAT_PUMP:
+                    base_params = ["ver"]
+                else:
+                    base_params = AuxProducts.get_params_list(dev.get("productId")) or ["ver"]
+
                 dev_params_task = asyncio.create_task(
-                    self.get_device_params(dev, params=list([]))
+                    self.get_device_params(dev, params=base_params)
                 )
                 dev_special_params_task = None
 
-                if AuxProducts.get_special_params_list(dev["productId"]) is not None:
-                    dev_special_params_task = asyncio.create_task(
-                        self.get_device_params(
-                            dev,
-                            params=AuxProducts.get_special_params_list(
-                                dev["productId"]
-                            ),
+                # IMPORTANT: do NOT request special params for heat pumps.
+                # Many HP firmwares do not support direct reads (FUNCTION_NOT_SUPPORT etc.)
+                # We decode tank temperature from key_states snapshot instead.
+                if dev.get("productId") not in AuxProducts.DeviceType.HEAT_PUMP:
+                    special = AuxProducts.get_special_params_list(dev.get("productId"))
+                    if special is not None:
+                        dev_special_params_task = asyncio.create_task(
+                            self.get_device_params(dev, params=special)
                         )
-                    )
 
                 # Add tasks to the list
                 param_tasks.append([dev, dev_params_task, dev_special_params_task])
@@ -360,8 +384,9 @@ class AuxCloudAPI:
 
                 if dev_params is None or isinstance(dev_params, BaseException):
                     _LOGGER.error(
-                        "Error fetching device params for %s",
+                        "Error fetching device params for %s: %r",
                         dev["endpointId"],
+                        dev_params,
                     )
                     continue
 
@@ -371,6 +396,14 @@ class AuxCloudAPI:
                     dev_special_params, BaseException
                 ):
                     dev["params"].update(dev_special_params)
+
+                # --- HEAT PUMP FIX: decode tank temp from key_states snapshot ---
+                if dev.get("productId") in AuxProducts.DeviceType.HEAT_PUMP:
+                    key_states = dev["params"].get("key_states")
+                    decoded = _decode_hp_tank_temp_from_key_states(key_states)
+                    if decoded is not None:
+                        dev["params"][HP_HOT_WATER_TANK_TEMPERATURE] = decoded
+                # ---------------------------------------------------------------
 
                 dev["last_updated"] = time.strftime(
                     "%Y-%m-%d %H:%M:%S", time.localtime()
@@ -484,8 +517,24 @@ class AuxCloudAPI:
         if vals is None:
             vals = []
 
+        # API does not reliably support GET with empty params on newer heat pumps.
+        # The official app uses params=['ver'] to retrieve a full snapshot.
+        if act == "get" and not params:
+            params = ["ver"]
+            vals = []
+
         if act == "set" and len(params) != len(vals):
             raise Exception("Params and Vals must have the same length")
+
+        # Heat pump writes need "ver"=3 alongside the real param,
+        # matching the official AUX app.
+        if (
+            act == "set"
+            and device.get("productId") in AuxProducts.DeviceType.HEAT_PUMP
+            and "ver" not in params
+        ):
+            params.append("ver")
+            vals.append([{"idx": 1, "val": 3}])
 
         _LOGGER.debug(
             "Acting on device %s with params: %s and vals: %s",
@@ -518,6 +567,7 @@ class AuxCloudAPI:
                     namespace="DNA.KeyValueControl",
                     name="KeyValueControl",
                     message_id_prefix=device["endpointId"],
+                    timstamp=f"{int(time.time())}",
                 ),
                 "endpoint": {
                     "devicePairedInfo": {
@@ -537,8 +587,8 @@ class AuxCloudAPI:
 
         data["directive"]["payload"]["did"] = device["endpointId"]
 
-        # Special case for getting ambient mode
-        if len(params) == 1 and act == "get":
+        # Special case for some legacy firmwares: envtemp/mode reads require a placeholder vals payload
+        if act == "get" and len(params) == 1 and params[0] in ("envtemp", "mode"):
             data["directive"]["payload"]["vals"] = [[{"val": 0, "idx": 1}]]
 
         json_data = await self._make_request(
@@ -589,27 +639,3 @@ class AuxCloudAPI:
         params = list(values.keys())
         vals = [[{"idx": 1, "val": x}] for x in list(values.values())]
         return await self._act_device_params(device, "set", params, vals)
-
-    async def initialize_websocket(self):
-        """
-        Initialize the WebSocket connection to receive real-time updates.
-        """
-        if not self.is_logged_in():
-            raise AuxApiError("Cannot initialize WebSocket without being logged in.")
-
-        self.ws_api = AuxCloudWebSocket(
-            region=self.region,
-            headers=self._get_headers(CompanyId=COMPANY_ID, Origin=self.url),
-            loginsession=self.loginsession,
-            userid=self.userid,
-        )
-        await self.ws_api.initialize_websocket()
-
-        timeout = 10  # Timeout in seconds
-        start_time = time.time()
-        while not self.ws_api.api_initialized:
-            if time.time() - start_time > timeout:
-                raise TimeoutError("WebSocket API initialization timed out.")
-
-            _LOGGER.debug("Waiting for WebSocket API to initialize...")
-            await asyncio.sleep(1)

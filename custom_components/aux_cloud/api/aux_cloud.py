@@ -504,19 +504,33 @@ class AuxCloudAPI:
 
         raise AuxApiError(f"Failed to query device state: {json_data}")
 
-    async def _send_device_params_request(
+    async def _act_device_params(
         self,
         device: dict,
         act: str,
-        params: list[str],
-        vals: list[str],
-        use_hp_set_mode: bool = False,
+        params: list[str] = None,
+        vals: list[str] = None,
     ):
-        """Send a KeyValueControl request.
-
-        - Default path preserves original/upstream behavior.
-        - Heat pump SET mode adds ver=3 and timstamp, matching the observed app payload.
         """
+        Query device parameters. If no parameters are provided, default parameters are queried.
+        https://docs-ibroadlink-com.translate.goog/public/configuration-sdk+ctc/message_table/?_x_tr_sl=auto&_x_tr_tl=en&_x_tr_hl=en&_x_tr_pto=wapp
+        """
+
+        if params is None:
+            params = []
+        if vals is None:
+            vals = []
+
+        if act == "set" and len(params) != len(vals):
+            raise Exception("Params and Vals must have the same length")
+
+        _LOGGER.debug(
+            "Acting on device %s with params: %s and vals: %s",
+            device["endpointId"],
+            params,
+            vals,
+        )
+
         cookie = json.loads(base64.b64decode(device["cookie"].encode()))
         mapped_cookie = base64.b64encode(
             json.dumps(
@@ -538,23 +552,20 @@ class AuxCloudAPI:
         req_params = list(params)
         req_vals = list(vals)
 
-        if use_hp_set_mode and act == "set":
-            if "ver" not in req_params:
-                req_params.append("ver")
-                req_vals.append([{"idx": 1, "val": 3}])
+        if (
+            AuxProducts.is_v3_heat_pump(device)
+            and "ver" not in req_params
+            and act == "set"
+        ):
+            req_params.append("ver")
+            req_vals.append([{"idx": 1, "val": 3}])
 
-            header = self._get_directive_header(
-                namespace="DNA.KeyValueControl",
-                name="KeyValueControl",
-                message_id_prefix=device["endpointId"],
-                timstamp=f"{int(time.time())}",
-            )
-        else:
-            header = self._get_directive_header(
-                namespace="DNA.KeyValueControl",
-                name="KeyValueControl",
-                message_id_prefix=device["endpointId"],
-            )
+        header = self._get_directive_header(
+            namespace="DNA.KeyValueControl",
+            name="KeyValueControl",
+            message_id_prefix=device["endpointId"],
+            timstamp=f"{int(time.time())}",
+        )
 
         data = {
             "directive": {
@@ -580,11 +591,13 @@ class AuxCloudAPI:
         # Keep original integration behavior for single-param GET
         if len(req_params) == 1 and act == "get":
             data["directive"]["payload"]["vals"] = [[{"val": 0, "idx": 1}]]
-
         json_data = await self._make_request(
             method="POST",
             endpoint="device/control/v2/sdkcontrol",
             data=data,
+            # Theoretically license in query param is not needed but
+            # I'm following the original request made from the app,
+            # just in case.
             params={"license": LICENSE},
             headers=self._get_headers(),
             ssl=False,
@@ -598,6 +611,7 @@ class AuxCloudAPI:
             and "data" in json_data["event"]["payload"]
             and "header" in json_data["event"]
             and "name" in json_data["event"]["header"]
+            # Ensure it's not an error response
             and json_data["event"]["header"]["name"] == "Response"
         ):
             response = json.loads(json_data["event"]["payload"]["data"])
@@ -609,51 +623,6 @@ class AuxCloudAPI:
             return response_dict
 
         raise AuxApiError(f"Failed to query device state: {data}, {json_data}")
-
-    async def _act_device_params(
-        self, device: dict, act: str, params: list[str] = None, vals: list[str] = None
-    ):
-        """
-        Query device parameters.
-
-        Original behavior for normal devices.
-        Heat pump SET uses app-like payload (ver=3 + timstamp).
-        """
-        if params is None:
-            params = []
-        if vals is None:
-            vals = []
-
-        is_heat_pump = device.get("productId") in AuxProducts.DeviceType.HEAT_PUMP
-
-        if act == "set" and len(params) != len(vals):
-            raise Exception("Params and Vals must have the same length")
-
-        _LOGGER.debug(
-            "Acting on device %s with params: %s and vals: %s",
-            device["endpointId"],
-            params,
-            vals,
-        )
-
-        # Heat pumps need app-like SET payloads for control to actually apply
-        if is_heat_pump and act == "set":
-            return await self._send_device_params_request(
-                device=device,
-                act=act,
-                params=params,
-                vals=vals,
-                use_hp_set_mode=True,
-            )
-
-        # Everyone else keeps original behavior
-        return await self._send_device_params_request(
-            device=device,
-            act=act,
-            params=params,
-            vals=vals,
-            use_hp_set_mode=False,
-        )
 
     async def get_device_params(self, device: dict, params: list[str] = None):
         """

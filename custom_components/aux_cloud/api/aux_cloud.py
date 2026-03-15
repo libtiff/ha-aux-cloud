@@ -74,7 +74,7 @@ class AuxApiError(Exception):
     """Exception raised when querying devices fails."""
 
 
-def _decode_hp_tank_temp_from_key_states(key_states_hex: str) -> int | None:
+def _decode_v3_hp_tank_temp_from_key_states(key_states_hex: str) -> int | None:
     """Decode heat pump tank temperature from key_states.
 
     Observed encoding:
@@ -129,8 +129,8 @@ class AuxCloudAPI:
             "User-Agent": SPOOF_USER_AGENT,
             "system": SPOOF_SYSTEM,
             "appPlatform": SPOOF_APP_PLATFORM,
-            "loginsession": self.loginsession or "",
-            "userid": self.userid or "",
+            "loginsession": self.loginsession or "",  # Ensure no None values
+            "userid": self.userid or "",  # Ensure no None values
             **kwargs,
         }
 
@@ -196,7 +196,9 @@ class AuxCloudAPI:
         }
         json_payload = json.dumps(payload, separators=(",", ":"))
 
+        # Token used as an obfuscation attempt, the server validates this
         token = hashlib.md5(f"{json_payload}{BODY_ENCRYPT_KEY}".encode()).hexdigest()
+        # Token used as key in aes encryption of json body
         md5 = hashlib.md5(
             f"{current_time}{TIMESTAMP_TOKEN_ENCRYPT_KEY}".encode()
         ).digest()
@@ -341,7 +343,12 @@ class AuxCloudAPI:
                 # For heat pumps, use ["ver"] because newer models need snapshot mode.
                 if is_heat_pump:
                     dev_params_task = asyncio.create_task(
-                        self.get_device_params(dev, params=["ver"])
+                        self.get_device_params(
+                            dev,
+                            params=(
+                                ["ver"] if AuxProducts.is_v3_heat_pump(dev) else []
+                            ),
+                        )
                     )
                     dev_special_params_task = None
                 else:
@@ -350,15 +357,17 @@ class AuxCloudAPI:
                     )
                     dev_special_params_task = None
 
-                    if AuxProducts.get_special_params_list(dev["productId"]) is not None:
-                        dev_special_params_task = asyncio.create_task(
-                            self.get_device_params(
-                                dev,
-                                params=AuxProducts.get_special_params_list(
-                                    dev["productId"]
-                                ),
-                            )
+                if AuxProducts.get_special_params_list(
+                    dev["productId"]
+                ) is not None and not AuxProducts.is_v3_heat_pump(dev):
+                    dev_special_params_task = asyncio.create_task(
+                        self.get_device_params(
+                            dev,
+                            params=AuxProducts.get_special_params_list(
+                                dev["productId"]
+                            ),
                         )
+                    )
 
                 param_tasks.append([dev, dev_params_task, dev_special_params_task])
 
@@ -393,9 +402,9 @@ class AuxCloudAPI:
                     dev["params"].update(dev_special_params)
 
                 # Heat pump tank temperature decoding
-                if dev.get("productId") in AuxProducts.DeviceType.HEAT_PUMP:
+                if AuxProducts.is_v3_heat_pump(dev):
                     key_states = dev["params"].get("key_states")
-                    decoded = _decode_hp_tank_temp_from_key_states(key_states)
+                    decoded = _decode_v3_hp_tank_temp_from_key_states(key_states)
                     if decoded is not None:
                         dev["params"][HP_HOT_WATER_TANK_TEMPERATURE] = decoded
 

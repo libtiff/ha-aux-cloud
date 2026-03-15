@@ -58,7 +58,9 @@ async def async_setup_entry(
                 AuxWaterHeaterEntity(
                     coordinator,
                     device["endpointId"],
-                    entity_description=WATER_HEATER_ENTITIES["water_heater"]["description"],
+                    entity_description=WATER_HEATER_ENTITIES["water_heater"][
+                        "description"
+                    ],
                 )
             )
             _LOGGER.debug(
@@ -84,8 +86,8 @@ class AuxWaterHeaterEntity(BaseEntity, CoordinatorEntity, WaterHeaterEntity):
         super().__init__(coordinator, device_id, entity_description)
 
         self._attr_temperature_unit = UnitOfTemperature.CELSIUS
-        self._attr_min_temp = 0
-        self._attr_max_temp = 75
+        self._attr_min_temp = 0  # Minimum temperature in Celsius
+        self._attr_max_temp = 75  # Maximum temperature in Celsius
         self._attr_target_temperature_step = 1
 
         self._attr_supported_features = (
@@ -98,9 +100,8 @@ class AuxWaterHeaterEntity(BaseEntity, CoordinatorEntity, WaterHeaterEntity):
 
     @property
     def current_temperature(self):
-        """Return the current water tank temperature (C)."""
-        value = self._get_device_params().get(HP_HOT_WATER_TANK_TEMPERATURE)
-        return value / 10 if value is not None else None
+        """Return the current water temperature."""
+        return self._get_device_params().get(HP_HOT_WATER_TANK_TEMPERATURE, 0)
 
     @property
     def target_temperature(self):

@@ -101,7 +101,8 @@ class AuxWaterHeaterEntity(BaseEntity, CoordinatorEntity, WaterHeaterEntity):
     @property
     def current_temperature(self):
         """Return the current water temperature."""
-        return self._get_device_params().get(HP_HOT_WATER_TANK_TEMPERATURE, 0)
+        value = self._get_device_params().get(HP_HOT_WATER_TANK_TEMPERATURE, 0)
+        return value / 10 if AuxProducts.is_v3_heat_pump(self._device) else value
 
     @property
     def target_temperature(self):
